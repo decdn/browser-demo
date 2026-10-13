@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width" />
+    <title>deCDN in the browser</title>
+    <style>
+      body { font: 16px/1.5 system-ui, sans-serif; max-width: 44rem; margin: 3rem auto; padding: 0 1rem; }
+      code { font-size: 13px; word-break: break-all; }
+      .hint { color: #57606a; font-size: 14px; }
+    </style>
+  </head>
+  <body>
+    <h1>deCDN in the browser</h1>
+    <p class="hint">
+      With the deCDN links extension and <code>decdn gateway</code> running, the links below open
+      through your gateway: it fetches each file from deCDN nodes, checks every byte against its
+      BLAKE3 hash, and streams it to the browser.
+    </p>
+
+    <h2>An image in the page</h2>
+    <p class="hint">
+      <code>&lt;img src="decdn:4621…/stabilityai-stable-diffusion-xl-base-1.0/01.png?ns=1"&gt;</code>,
+      a 4.6 MB sample from the Stable Diffusion XL bundle.
+    </p>
+    <img
+      src="decdn:4621f13ec126975bff9f4f7a90283569bc5f81fc902e8f3dfc1ac9acadf954ed/stabilityai-stable-diffusion-xl-base-1.0/01.png?ns=1"
+      alt="A sample image from the Stable Diffusion XL bundle"
+      style="max-width: 100%"
+    />
+
+    <h2>A file</h2>
+    <p>
+      <a href="decdn:ce88d839ce93b3d62c500567602ea372a9b6b043866bdf327e508f7226efe06e?ns=1">
+        A 107.6 MiB test file</a>
+    </p>
+    <p><code>decdn:ce88d839ce93b3d62c500567602ea372a9b6b043866bdf327e508f7226efe06e?ns=1</code></p>
+
+    <h2>A bundle</h2>
+    <p>
+      <a href="decdn:87539fba0ee64b9f7814d50af89988b0e10f624340dd6e8477a0984c27eaab42/?ns=1">
+        Sintel 4K</a>, the Blender open movie: the bundle's file list.
+    </p>
+
+    <h2>A file inside the bundle</h2>
+    <p>
+      <a href="decdn:87539fba0ee64b9f7814d50af89988b0e10f624340dd6e8477a0984c27eaab42/sintel-4k-mkv/Sintel.2010.4k.mkv?ns=1">
+        Sintel.2010.4k.mkv</a> (4.2 GiB)
+    </p>
+
+    <h2>Added after the page loads</h2>
+    <p id="later"></p>
+    <script>
+      setTimeout(() => {
+        const a = document.createElement("a");
+        a.href = "decdn:4621f13ec126975bff9f4f7a90283569bc5f81fc902e8f3dfc1ac9acadf954ed?ns=1";
+        a.textContent = "A bundle manifest, as raw JSON (1.4 MiB)";
+        document.getElementById("later").append(a);
+      }, 1000);
+    </script>
+  </body>
+</html>

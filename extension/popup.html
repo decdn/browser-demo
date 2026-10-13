@@ -1,0 +1,22 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <style>
+      body { font: 13px system-ui, sans-serif; width: 300px; margin: 12px; }
+      h1 { font-size: 15px; margin: 0 0 8px; }
+      input { width: 140px; }
+      #status { margin: 8px 0; }
+      .ok { color: #1a7f37; }
+      .warn { color: #9a6700; }
+      .err { color: #cf222e; }
+    </style>
+  </head>
+  <body>
+    <h1>deCDN gateway</h1>
+    <div id="status">Checking…</div>
+    <label>Gateway <input id="gateway" /></label>
+    <button id="save">Save</button>
+    <script src="popup.js"></script>
+  </body>
+</html>
