@@ -39,11 +39,16 @@ demos run the same SDK inside an app; this one puts it behind the browser.
   it arrives, and a bundle (`/<hash>/`) gets a page listing its files. It holds one delegate key
   per capability, in memory only:
   - `GET /_delegate` mints a fresh key and returns its address. Every call returns a new
-    address, so no site sees the same one twice and none can follow you across sites.
+    address, so no site sees the same one twice and none can follow you across sites. A page
+    calls it through CORS; the extension calls it with the gateway token. The pages of one site
+    (subdomains included) hold at most a few keys, waiting or registered; the extension's own
+    handshake is never limited.
   - `PUT /_capability` with `{"capability": "dcap1:…", "scope": "…"}` registers a capability
-    issued to a minted address. A page registers through CORS, and its scope must cover its own
-    host: `example.com` may register `example.com`, `*.example.com` or `*`, never another site.
-    The gateway token registers any scope.
+    issued to a minted address. Its owner signature must match the on-chain owner of its pool.
+    A page registers through CORS, and its scope must cover its own host: `example.com` may
+    register `example.com`, `*.example.com` or `*`, never another site, and never a wildcard
+    over a public suffix such as `*.io` or `*.github.io`. The extension, with the
+    gateway token, registers any scope.
   - A content request pays with the capability whose scope covers the page's host: an exact
     host first, then `*.<domain>`, then `*`.
 - **The extension** ([`extension/`](extension/)) rewrites `decdn:` URLs in `href`, `src`,
@@ -67,9 +72,9 @@ the bare hash names a file, a trailing `/` a whole bundle, and a path one file i
    ```
 
    It listens on `127.0.0.1:8484` and prints its token, which it keeps in
-   `~/.decdn/gateway/token`. `decdn gateway` arrives with
-   [decdn/decdn#2456](https://github.com/decdn/decdn/pull/2456); until a release includes it,
-   build `decdn` from that branch with `cargo build --release -p decdn-cli`.
+   `~/.decdn/gateway/token`. Until a `decdn` release includes `decdn gateway`, build it from
+   the `main` branch of [decdn/decdn](https://github.com/decdn/decdn) with
+   `cargo build --release -p decdn-cli`.
 2. Load the extension. In Chrome or Brave, open `chrome://extensions`, turn on **Developer
    mode**, click **Load unpacked**, and pick the `extension/` folder. In Firefox, open
    `about:debugging#/runtime/this-firefox` and **Load Temporary Add-on** with
