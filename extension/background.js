@@ -121,8 +121,8 @@ resume();
 // Mint a delegate, record it as pending before anything can stop this worker,
 // open the onramp's check for it, and poll until its capability is registered.
 async function startSponsor() {
-  const { gateway } = await settings();
-  const r = await fetch(`http://${gateway}/_delegate`);
+  const { gateway, token } = await settings();
+  const r = await fetch(`http://${gateway}/_delegate`, { headers: { "x-decdn-token": token } });
   if (!r.ok) throw new Error(`the gateway answered ${r.status}`);
   const { address } = await r.json();
   await setPending(address, Date.now());

@@ -39,11 +39,14 @@ demos run the same SDK inside an app; this one puts it behind the browser.
   it arrives, and a bundle (`/<hash>/`) gets a page listing its files. It holds one delegate key
   per capability, in memory only:
   - `GET /_delegate` mints a fresh key and returns its address. Every call returns a new
-    address, so no site sees the same one twice and none can follow you across sites.
+    address, so no site sees the same one twice and none can follow you across sites. A page
+    calls it through CORS; the extension calls it with the gateway token. Each page origin keeps
+    at most a few keys waiting for a capability.
   - `PUT /_capability` with `{"capability": "dcap1:…", "scope": "…"}` registers a capability
-    issued to a minted address. A page registers through CORS, and its scope must cover its own
-    host: `example.com` may register `example.com`, `*.example.com` or `*`, never another site.
-    The gateway token registers any scope.
+    issued to a minted address. Its owner signature must match the on-chain owner of its pool.
+    A page registers through CORS, and its scope must cover its own host: `example.com` may
+    register `example.com`, `*.example.com` or `*`, never another site. The extension, with the
+    gateway token, registers any scope.
   - A content request pays with the capability whose scope covers the page's host: an exact
     host first, then `*.<domain>`, then `*`.
 - **The extension** ([`extension/`](extension/)) rewrites `decdn:` URLs in `href`, `src`,
