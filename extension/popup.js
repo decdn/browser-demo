@@ -1,12 +1,11 @@
 // Connects to the gateway, lists its capabilities, and gets a sponsored one.
 //
-// The sponsored allowance is the onramp's handshake, run here rather than in
-// the gateway: get a fresh delegate address from the gateway, pass the
-// onramp's check for it in a new tab, poll the onramp for the capability it
-// issues, and register that capability with the gateway for every site.
+// The sponsored allowance is the onramp's handshake, which the background
+// worker runs rather than the gateway: get a fresh delegate address from the
+// gateway, pass the onramp's check for it in a new tab, poll the onramp for
+// the capability it issues, and register that capability for every site.
 
 const DEFAULT_GATEWAY = "127.0.0.1:8484";
-const ONRAMP = "https://up.decdn.org";
 const $ = (id) => document.getElementById(id);
 
 function show(html, cls) {
@@ -43,7 +42,16 @@ async function refresh() {
     if (r.status === 401) return show("The gateway token does not match.", "err");
     const capabilities = await r.json();
     const live = capabilities.filter((c) => !c.spent);
-    show(live.length ? "Running." : "Running, with no capability yet.", live.length ? "ok" : "warn");
+    const { pending } = await chrome.storage.session.get({ pending: {} });
+    const waiting = Object.keys(pending).length;
+    if (waiting) {
+      // Wakes the background worker if Chrome stopped it mid-wait.
+      chrome.runtime.sendMessage({ type: "resume" });
+      setTimeout(refresh, 2000);
+    }
+    if (live.length) show("Running.", "ok");
+    else if (waiting) show("Waiting for the onramp check to finish…", "warn");
+    else show("Running, with no capability yet.", "warn");
     for (const c of capabilities) {
       const li = document.createElement("li");
       li.innerHTML = describe(c);
@@ -54,19 +62,13 @@ async function refresh() {
   }
 }
 
+// The background worker runs the whole handshake: opening the onramp tab
+// closes this popup, and anything still running here would stop with it.
 async function sponsor() {
-  const { gateway, token } = await settings();
+  const { token } = await settings();
   if (!token) return show("Paste the gateway token under Settings first.", "warn");
-  try {
-    const { address } = await (await fetch(`http://${gateway}/_delegate`)).json();
-    await chrome.tabs.create({ url: `${ONRAMP}/fund?client=${address}` });
-    show("Pass the check in the new tab; this popup can close.", "warn");
-    // The background worker polls the onramp, so it keeps going after this
-    // popup closes.
-    chrome.runtime.sendMessage({ type: "sponsor", address });
-  } catch (e) {
-    show(`Could not start: ${e.message}`, "err");
-  }
+  const reply = await chrome.runtime.sendMessage({ type: "sponsor" });
+  if (reply && reply.error) show(`Could not start: ${reply.error}`, "err");
 }
 
 $("save").addEventListener("click", async () => {

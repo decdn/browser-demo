@@ -56,32 +56,90 @@ async function label(host) {
 const ONRAMP = "https://up.decdn.org";
 const SPONSOR_TIMEOUT_MS = 10 * 60 * 1000;
 
-async function sponsor(address) {
-  const deadline = Date.now() + SPONSOR_TIMEOUT_MS;
-  while (Date.now() < deadline) {
-    try {
-      const r = await fetch(`${ONRAMP}/v1/capability?client=${address}`);
-      if (r.status === 200) {
-        const { token: capability } = await r.json();
-        const { gateway, token } = await settings();
-        const put = await fetch(`http://${gateway}/_capability`, {
-          method: "PUT",
-          headers: { "content-type": "application/json", "x-decdn-token": token },
-          body: JSON.stringify({ capability, scope: "*" }),
-        });
-        return put.ok;
+// The delegates waiting for a check live in session storage, so a worker that
+// Chrome stops and restarts picks them up again.
+async function pendingDelegates() {
+  const { pending } = await chrome.storage.session.get({ pending: {} });
+  return pending;
+}
+
+async function setPending(address, since) {
+  const pending = await pendingDelegates();
+  if (since) pending[address] = since;
+  else delete pending[address];
+  await chrome.storage.session.set({ pending });
+}
+
+// One look at the onramp for `address`: registers the capability when it is
+// there. Returns true once the delegate needs no more polling.
+async function claim(address) {
+  const r = await fetch(`${ONRAMP}/v1/capability?client=${address}`);
+  if (r.status !== 200) return false;
+  const { token: capability } = await r.json();
+  const { gateway, token } = await settings();
+  const put = await fetch(`http://${gateway}/_capability`, {
+    method: "PUT",
+    headers: { "content-type": "application/json", "x-decdn-token": token },
+    body: JSON.stringify({ capability, scope: "*" }),
+  });
+  // 409: already registered, or the gateway no longer holds the delegate.
+  return put.ok || put.status === 409;
+}
+
+const polling = new Set();
+
+async function poll(address) {
+  if (polling.has(address)) return;
+  polling.add(address);
+  try {
+    while (true) {
+      const pending = await pendingDelegates();
+      const since = pending[address];
+      if (!since || Date.now() - since > SPONSOR_TIMEOUT_MS) break;
+      try {
+        if (await claim(address)) break;
+      } catch {
+        // The onramp or the gateway is briefly unreachable; keep polling.
       }
-    } catch {
-      // The onramp or the gateway is briefly unreachable; keep polling.
+      // An extension API call resets Chrome's idle timer, so the worker is
+      // not stopped while it waits for the person to pass the check.
+      await chrome.runtime.getPlatformInfo();
+      await new Promise((resolve) => setTimeout(resolve, 2000));
     }
-    await new Promise((resolve) => setTimeout(resolve, 2000));
+  } finally {
+    polling.delete(address);
+    await setPending(address, null);
   }
-  return false;
+}
+
+async function resume() {
+  for (const address of Object.keys(await pendingDelegates())) poll(address);
+}
+
+resume();
+
+// Mint a delegate, record it as pending before anything can stop this worker,
+// open the onramp's check for it, and poll until its capability is registered.
+async function startSponsor() {
+  const { gateway } = await settings();
+  const r = await fetch(`http://${gateway}/_delegate`);
+  if (!r.ok) throw new Error(`the gateway answered ${r.status}`);
+  const { address } = await r.json();
+  await setPending(address, Date.now());
+  poll(address);
+  await chrome.tabs.create({ url: `${ONRAMP}/fund?client=${address}` });
 }
 
 chrome.runtime.onMessage.addListener((message, sender, reply) => {
   if (message && message.type === "sponsor" && !sender.tab) {
-    sponsor(message.address);
+    startSponsor().then(
+      () => reply({}),
+      (e) => reply({ error: e.message }),
+    );
+    return true;
+  }
+  if (message && message.type === "resume" && !sender.tab) {
+    resume();
     return false;
   }
   if (message && message.type === "label" && sender.url) {
