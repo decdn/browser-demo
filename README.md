@@ -72,9 +72,9 @@ the bare hash names a file, a trailing `/` a whole bundle, and a path one file i
    ```
 
    It listens on `127.0.0.1:8484` and prints its token, which it keeps in
-   `~/.decdn/gateway/token`. `decdn gateway` arrives with
-   [decdn/decdn#2456](https://github.com/decdn/decdn/pull/2456); until a release includes it,
-   build `decdn` from that branch with `cargo build --release -p decdn-cli`.
+   `~/.decdn/gateway/token`. Until a `decdn` release includes `decdn gateway`, build it from
+   the `main` branch of [decdn/decdn](https://github.com/decdn/decdn) with
+   `cargo build --release -p decdn-cli`.
 2. Load the extension. In Chrome or Brave, open `chrome://extensions`, turn on **Developer
    mode**, click **Load unpacked**, and pick the `extension/` folder. In Firefox, open
    `about:debugging#/runtime/this-firefox` and **Load Temporary Add-on** with
