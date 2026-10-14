@@ -46,7 +46,8 @@ demos run the same SDK inside an app; this one puts it behind the browser.
   - `PUT /_capability` with `{"capability": "dcap1:…", "scope": "…"}` registers a capability
     issued to a minted address. Its owner signature must match the on-chain owner of its pool.
     A page registers through CORS, and its scope must cover its own host: `example.com` may
-    register `example.com`, `*.example.com` or `*`, never another site. The extension, with the
+    register `example.com`, `*.example.com` or `*`, never another site, and never a wildcard
+    over a public suffix such as `*.io` or `*.github.io`. The extension, with the
     gateway token, registers any scope.
   - A content request pays with the capability whose scope covers the page's host: an exact
     host first, then `*.<domain>`, then `*`.
