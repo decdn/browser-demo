@@ -1,10 +1,13 @@
 // Rewrites decdn: URLs in the page to the local decdn gateway.
 //
-// decdn:<hash>[/<path>][?ns=<id>] becomes http://<gateway>/<hash>[/<path>][?ns=<id>],
-// on links and on media sources, including elements the page adds later. On
-// the first decdn: URL it finds, the script asks the background worker to
-// label this page's requests to the gateway, and rewrites only once the label
-// is in place, so no request reaches the gateway without it.
+// decdn:<hash>[/<path>][?ns=<id>] becomes http://<gateway>/<hash>[/<path>][?ns=<id>]
+// in href, src, poster, data, srcset, imagesrcset and SVG xlink:href, including
+// elements the page adds or changes later and those inside open shadow roots.
+// Only URLs that start with a 64-hex hash are rewritten; any other decdn: value
+// is left alone. On the first decdn: URL it finds, the script asks the
+// background worker to label this page's requests to the gateway, and rewrites
+// only once the label is in place, so no request reaches the gateway without
+// it. A new token or gateway puts the original URLs back and labels again.
 
 const SCHEME = "decdn:";
 const ATTRIBUTES = ["href", "src", "poster", "data"];
@@ -76,21 +79,22 @@ const set = (el, [name, ns], value) =>
 // data-decdn-src, data-decdn-srcset, data-decdn-xlink-href, ...
 const original = ([name, ns]) => `decdn${ns ? "XlinkH" + name.slice(1) : name[0].toUpperCase() + name.slice(1)}`;
 
-// Open shadow roots are scanned and observed too.
-const roots = new Set();
-
-function matches(root) {
-  const nodes = root.querySelectorAll ? [...root.querySelectorAll(SELECTOR)] : [];
-  if (root.matches && root.matches(SELECTOR)) nodes.push(root);
+// Every element under `root` that matches `selector`, including those inside
+// open shadow roots, which are observed from here on too.
+function deepQuery(root, selector) {
+  const nodes = root.querySelectorAll ? [...root.querySelectorAll(selector)] : [];
+  if (root.matches && root.matches(selector)) nodes.push(root);
   const hosts = root.querySelectorAll ? [...root.querySelectorAll("*")] : [];
   if (root.shadowRoot) hosts.push(root);
   for (const host of hosts) {
     if (!host.shadowRoot) continue;
     observe(host.shadowRoot);
-    nodes.push(...matches(host.shadowRoot));
+    nodes.push(...deepQuery(host.shadowRoot, selector));
   }
   return nodes;
 }
+
+const matches = (root) => deepQuery(root, SELECTOR);
 
 async function rewrite(root) {
   const nodes = matches(root);
@@ -123,25 +127,30 @@ async function rewrite(root) {
   }
 }
 
+// Whether a changed attribute is one this script rewrites.
+function watched(m) {
+  if (m.attributeNamespace === XLINK) return m.attributeName === "href";
+  return !m.attributeNamespace && PLAIN.some(([name]) => name === m.attributeName);
+}
+
 const observer = new MutationObserver((mutations) => {
   for (const m of mutations) {
-    if (m.type === "attributes") rewrite(m.target);
+    if (m.type === "attributes" && watched(m)) rewrite(m.target);
     for (const node of m.addedNodes) {
       if (node.nodeType === Node.ELEMENT_NODE) rewrite(node);
     }
   }
 });
 
+// Roots already observed; weak, so removed shadow roots can be collected.
+const observed = new WeakSet();
+
 function observe(root) {
-  if (roots.has(root)) return;
-  roots.add(root);
-  // attributeFilter takes local names, so "href" also covers xlink:href.
-  observer.observe(root, {
-    subtree: true,
-    childList: true,
-    attributes: true,
-    attributeFilter: [...ATTRIBUTES, ...SRCSETS],
-  });
+  if (observed.has(root)) return;
+  observed.add(root);
+  // No attributeFilter: it never matches a namespaced attribute such as
+  // xlink:href, so watched() filters instead.
+  observer.observe(root, { subtree: true, childList: true, attributes: true });
 }
 
 // Runs at document_start: the observer sees every element the parser adds,
@@ -149,19 +158,23 @@ function observe(root) {
 observe(document);
 rewrite(document);
 
-// A new token or gateway drops every label: put the decdn: URLs back, so the
-// observer labels the page again and rewrites them to the current gateway.
+// The data-decdn-* attribute holding each rewritten attribute's original value.
+const dataAttr = (attr) => `data-${original(attr).replace(/[A-Z]/g, (c) => "-" + c.toLowerCase())}`;
+const RESTORE = ALL.map((attr) => `[${dataAttr(attr)}]`).join(",");
+
+// A new token or gateway drops every label: put the decdn: URLs back, then
+// rewrite the whole page again, so a page that loaded before the token was set
+// gets rewritten too.
 chrome.storage.onChanged.addListener((changes) => {
   if (!changes.token && !changes.gateway) return;
   labelled = null;
-  for (const root of roots) {
+  for (const el of deepQuery(document, RESTORE)) {
     for (const attr of ALL) {
       const key = original(attr);
-      const data = `data-${key.replace(/[A-Z]/g, (c) => "-" + c.toLowerCase())}`;
-      for (const el of root.querySelectorAll(`[${data}]`)) {
-        set(el, attr, el.dataset[key]);
-        delete el.dataset[key];
-      }
+      if (!(key in el.dataset)) continue;
+      set(el, attr, el.dataset[key]);
+      delete el.dataset[key];
     }
   }
+  rewrite(document);
 });

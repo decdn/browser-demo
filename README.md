@@ -51,12 +51,14 @@ demos run the same SDK inside an app; this one puts it behind the browser.
     gateway token, registers any scope.
   - A content request pays with the capability whose scope covers the page's host: an exact
     host first, then `*.<domain>`, then `*`.
-- **The extension** ([`extension/`](extension/)) rewrites `decdn:` URLs in `href`, `src`,
-  `poster` and `data` attributes to the gateway, including elements a page adds later, and
-  labels the page's image, media and navigation requests to the gateway with the gateway token
-  and the page's host. The browser adds those headers, so page scripts never see the token, and
-  a page's own `fetch()` never carries it. The popup lists the gateway's capabilities and gets
-  a sponsored one.
+- **The extension** ([`extension/`](extension/)) rewrites `decdn:<hash>…` URLs in `href`,
+  `src`, `poster`, `data`, `srcset`, `imagesrcset` and SVG `xlink:href` attributes to the
+  gateway, including elements a page adds or changes later and those inside open shadow roots.
+  It labels the page's `GET` and `HEAD` image, media, object, frame and navigation requests for
+  gateway content (`/<hash>…`) with the gateway token and the page's host. The browser adds
+  those headers, so page scripts never see the token, a page's own `fetch()` never carries it,
+  and no page request brings it to `/_delegate` or `/_capability`. The popup lists the
+  gateway's capabilities and gets a sponsored one.
 - Networking stays native. The gateway reaches nodes over direct QUIC like any `decdn` client,
   so the browser needs no WebTransport, WebRTC or relay.
 
@@ -80,6 +82,8 @@ the bare hash names a file, a trailing `/` a whole bundle, and a path one file i
    `about:debugging#/runtime/this-firefox` and **Load Temporary Add-on** with
    `extension/manifest.json`.
 3. Open the extension's popup, paste the gateway token under **Settings**, and click **Save**.
+   The gateway address must be `127.0.0.1:<port>` or `localhost:<port>`. For a port other than
+   `8484`, or if host access was revoked, the browser asks for access to it; allow it.
 4. Click **Get a sponsored allowance** and pass the check on the page that opens. The extension
    registers the capability the testnet sponsor at `up.decdn.org` issues, for every site
    (`*`). Open the popup again to see it.
