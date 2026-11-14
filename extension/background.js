@@ -7,7 +7,14 @@
 // it. The gateway pays with the capability whose scope covers the host.
 
 const DEFAULT_GATEWAY = "127.0.0.1:8484";
-const RESOURCE_TYPES = ["image", "media", "main_frame", "sub_frame", "object", "other"];
+const RESOURCE_TYPES = ["image", "media", "main_frame", "sub_frame", "object"];
+
+// Only content paths (/<64-hex hash>...) get the token, never the gateway's
+// own /_delegate or /_capability endpoints, and only on GET or HEAD.
+function contentFilter(gateway) {
+  const escaped = gateway.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return `^http://${escaped}/[0-9a-fA-F]{64}([/?#]|$)`;
+}
 
 // A stable rule id per page host (DNR ids are positive 31-bit integers).
 function ruleId(host) {
@@ -22,16 +29,19 @@ async function settings() {
   return { gateway, token };
 }
 
-async function label(host) {
+async function label(host, origin) {
   const { gateway, token } = await settings();
   if (!token) return { gateway, labelled: false };
+  // Content the gateway serves runs on the gateway's own origin; never label it.
+  if (origin === `http://${gateway}`) return { gateway, labelled: false };
   const id = ruleId(host);
   await chrome.declarativeNetRequest.updateSessionRules({
     removeRuleIds: [id],
     addRules: [
       {
         id,
-        priority: 1,
+        // initiatorDomains also matches subdomains: the most specific host wins.
+        priority: host.split(".").length,
         action: {
           type: "modifyHeaders",
           requestHeaders: [
@@ -40,13 +50,20 @@ async function label(host) {
           ],
         },
         condition: {
-          urlFilter: `|http://${gateway}/`,
+          regexFilter: contentFilter(gateway),
           initiatorDomains: [host],
+          requestMethods: ["get", "head"],
           resourceTypes: RESOURCE_TYPES,
         },
       },
     ],
   });
+  // The token or gateway changed while this rule went in: drop it again.
+  const now = await settings();
+  if (now.token !== token || now.gateway !== gateway) {
+    await chrome.declarativeNetRequest.updateSessionRules({ removeRuleIds: [id] });
+    return { gateway: now.gateway, labelled: false };
+  }
   return { gateway, labelled: true };
 }
 
@@ -143,21 +160,26 @@ chrome.runtime.onMessage.addListener((message, sender, reply) => {
     return false;
   }
   if (message && message.type === "label" && sender.url) {
-    const host = new URL(sender.url).hostname;
+    const { hostname: host, origin } = new URL(sender.url);
     if (host) {
-      label(host).then(reply, () => reply({ labelled: false }));
+      label(host, origin).then(reply, () => reply({ labelled: false }));
       return true;
     }
   }
   return false;
 });
 
-// A new token or gateway address makes every existing label stale.
+// A new token or gateway address makes every existing label stale. Pages
+// re-label straight away, so keep the rules already made with the new values.
 chrome.storage.onChanged.addListener(async (changes) => {
   if (changes.token || changes.gateway) {
+    const { gateway, token } = await settings();
+    const current = (r) =>
+      r.condition.regexFilter === contentFilter(gateway) &&
+      r.action.requestHeaders?.some((h) => h.header === "x-decdn-token" && h.value === token);
     const rules = await chrome.declarativeNetRequest.getSessionRules();
     await chrome.declarativeNetRequest.updateSessionRules({
-      removeRuleIds: rules.map((r) => r.id),
+      removeRuleIds: rules.filter((r) => !current(r)).map((r) => r.id),
     });
   }
 });
