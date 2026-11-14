@@ -1,37 +1,79 @@
 // Labels requests to the gateway with the gateway token and the page's host.
 //
 // A page's content script reports its host; this adds a session rule that sets
-// x-decdn-token and x-decdn-host on that page's image, media, frame and
-// navigation requests to the gateway. The browser adds the headers, so page
+// x-decdn-token and x-decdn-host on that page's GET and HEAD image, media,
+// object, frame and navigation requests for gateway content (/<hash>...), never
+// for the gateway's own /_ endpoints. The browser adds the headers, so page
 // scripts never see the token, and a page's own fetch() or XHR never carries
-// it. The gateway pays with the capability whose scope covers the host.
+// it. Pages the gateway itself serves are never labelled. The gateway pays with
+// the capability whose scope covers the host.
 
 const DEFAULT_GATEWAY = "127.0.0.1:8484";
-const RESOURCE_TYPES = ["image", "media", "main_frame", "sub_frame", "object", "other"];
+// The gateway is always on loopback: the token never leaves the machine.
+const GATEWAY = /^(127\.0\.0\.1|localhost):\d{1,5}$/;
+// Session rules are capped (5000 in Chrome); stay well under it.
+const MAX_RULES = 1000;
+const RESOURCE_TYPES = ["image", "media", "main_frame", "sub_frame", "object"];
 
-// A stable rule id per page host (DNR ids are positive 31-bit integers).
-function ruleId(host) {
-  let h = 0;
-  for (const c of host) h = (Math.imul(h, 31) + c.charCodeAt(0)) | 0;
-  return (h & 0x7fffffff) || 1;
+// Only content paths (/<64-hex hash>...) get the token, never the gateway's
+// own /_delegate or /_capability endpoints, and only on GET or HEAD.
+function contentFilter(gateway) {
+  const escaped = gateway.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return `^http://${escaped}/[0-9a-fA-F]{64}([/?#]|$)`;
+}
+
+// Runs storage read-modify-writes one at a time, so two callers never lose
+// each other's update.
+let queue = Promise.resolve();
+function serial(fn) {
+  const run = queue.then(fn);
+  queue = run.catch(() => {});
+  return run;
 }
 
 async function settings() {
   const { gateway } = await chrome.storage.sync.get({ gateway: DEFAULT_GATEWAY });
   const { token } = await chrome.storage.local.get({ token: "" });
-  return { gateway, token };
+  return { gateway: GATEWAY.test(gateway) ? gateway : DEFAULT_GATEWAY, token };
 }
 
-async function label(host) {
+// One rule id per page host, from a map in session storage: ids never
+// collide, and the least recently labelled host is dropped past MAX_RULES.
+// Returns [id, ids of evicted rules].
+function ruleId(host) {
+  return serial(async () => {
+    const { rules = {}, nextId = 1 } = await chrome.storage.session.get(["rules", "nextId"]);
+    const evicted = [];
+    let id = rules[host]?.id;
+    let next = nextId;
+    if (!id) {
+      id = next++;
+      const hosts = Object.keys(rules).sort((a, b) => rules[a].used - rules[b].used);
+      while (hosts.length >= MAX_RULES) {
+        const old = hosts.shift();
+        evicted.push(rules[old].id);
+        delete rules[old];
+      }
+    }
+    rules[host] = { id, used: Date.now() };
+    await chrome.storage.session.set({ rules, nextId: next });
+    return [id, evicted];
+  });
+}
+
+async function label(host, origin) {
   const { gateway, token } = await settings();
   if (!token) return { gateway, labelled: false };
-  const id = ruleId(host);
+  // Content the gateway serves runs on the gateway's own origin; never label it.
+  if (origin === `http://${gateway}`) return { gateway, labelled: false };
+  const [id, evicted] = await ruleId(host);
   await chrome.declarativeNetRequest.updateSessionRules({
-    removeRuleIds: [id],
+    removeRuleIds: [id, ...evicted],
     addRules: [
       {
         id,
-        priority: 1,
+        // initiatorDomains also matches subdomains: the most specific host wins.
+        priority: host.split(".").length,
         action: {
           type: "modifyHeaders",
           requestHeaders: [
@@ -40,13 +82,20 @@ async function label(host) {
           ],
         },
         condition: {
-          urlFilter: `|http://${gateway}/`,
+          regexFilter: contentFilter(gateway),
           initiatorDomains: [host],
+          requestMethods: ["get", "head"],
           resourceTypes: RESOURCE_TYPES,
         },
       },
     ],
   });
+  // The token or gateway changed while this rule went in: drop it again.
+  const now = await settings();
+  if (now.token !== token || now.gateway !== gateway) {
+    await chrome.declarativeNetRequest.updateSessionRules({ removeRuleIds: [id] });
+    return { gateway: now.gateway, labelled: false };
+  }
   return { gateway, labelled: true };
 }
 
@@ -63,15 +112,34 @@ async function pendingDelegates() {
   return pending;
 }
 
-async function setPending(address, since) {
-  const pending = await pendingDelegates();
-  if (since) pending[address] = since;
-  else delete pending[address];
-  await chrome.storage.session.set({ pending });
+// Keeps an alarm running while a delegate waits: if the browser stops the
+// worker anyway, the alarm wakes it and resume() picks the polling up again.
+const HEARTBEAT = "sponsor-heartbeat";
+
+function setPending(address, since) {
+  return serial(async () => {
+    const pending = await pendingDelegates();
+    if (since) pending[address] = since;
+    else delete pending[address];
+    await chrome.storage.session.set({ pending });
+    if (Object.keys(pending).length) await chrome.alarms.create(HEARTBEAT, { periodInMinutes: 0.5 });
+    else await chrome.alarms.clear(HEARTBEAT);
+  });
 }
 
+// A sponsorship that ended without a registered capability, kept in session
+// storage so the popup can say why: { address, error }.
+async function setFailed(failed) {
+  if (failed) await chrome.storage.session.set({ failed });
+  else await chrome.storage.session.remove("failed");
+}
+
+// The gateway refused the capability; polling again will not help.
+class Refused extends Error {}
+
 // One look at the onramp for `address`: registers the capability when it is
-// there. Returns true once the delegate needs no more polling.
+// there. Returns true once the delegate needs no more polling; throws Refused
+// when the gateway turns the capability down.
 async function claim(address) {
   const r = await fetch(`${ONRAMP}/v1/capability?client=${address}`);
   if (r.status !== 200) return false;
@@ -83,7 +151,11 @@ async function claim(address) {
     body: JSON.stringify({ capability, scope: "*" }),
   });
   // 409: already registered, or the gateway no longer holds the delegate.
-  return put.ok || put.status === 409;
+  if (put.ok || put.status === 409) return true;
+  if (put.status >= 400 && put.status < 500) {
+    throw new Refused(`the gateway refused the capability (${put.status})`);
+  }
+  return false;
 }
 
 const polling = new Set();
@@ -91,32 +163,53 @@ const polling = new Set();
 async function poll(address) {
   if (polling.has(address)) return;
   polling.add(address);
+  let failure = null;
   try {
     while (true) {
       const pending = await pendingDelegates();
       const since = pending[address];
-      if (!since || Date.now() - since > SPONSOR_TIMEOUT_MS) break;
+      if (!since) break;
+      if (Date.now() - since > SPONSOR_TIMEOUT_MS) {
+        failure = "the onramp check did not finish in time";
+        break;
+      }
       try {
         if (await claim(address)) break;
-      } catch {
+      } catch (e) {
+        if (e instanceof Refused) {
+          failure = e.message;
+          break;
+        }
         // The onramp or the gateway is briefly unreachable; keep polling.
+        console.warn("decdn: sponsor poll", address, e);
       }
       // An extension API call resets Chrome's idle timer, so the worker is
       // not stopped while it waits for the person to pass the check.
       await chrome.runtime.getPlatformInfo();
       await new Promise((resolve) => setTimeout(resolve, 2000));
     }
+  } catch (e) {
+    failure = e.message;
   } finally {
     polling.delete(address);
+    if (failure) {
+      console.error("decdn: sponsorship failed", address, failure);
+      await setFailed({ address, error: failure });
+    }
     await setPending(address, null);
   }
 }
 
 async function resume() {
-  for (const address of Object.keys(await pendingDelegates())) poll(address);
+  for (const address of Object.keys(await pendingDelegates())) {
+    poll(address).catch((e) => console.error("decdn: poll", address, e));
+  }
 }
 
-resume();
+resume().catch((e) => console.error("decdn: resume", e));
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === HEARTBEAT) resume().catch((e) => console.error("decdn: resume", e));
+});
 
 // Mint a delegate, record it as pending before anything can stop this worker,
 // open the onramp's check for it, and poll until its capability is registered.
@@ -125,8 +218,9 @@ async function startSponsor() {
   const r = await fetch(`http://${gateway}/_delegate`, { headers: { "x-decdn-token": token } });
   if (!r.ok) throw new Error(`the gateway answered ${r.status}`);
   const { address } = await r.json();
+  await setFailed(null);
   await setPending(address, Date.now());
-  poll(address);
+  poll(address).catch((e) => console.error("decdn: poll", address, e));
   await chrome.tabs.create({ url: `${ONRAMP}/fund?client=${address}` });
 }
 
@@ -139,25 +233,49 @@ chrome.runtime.onMessage.addListener((message, sender, reply) => {
     return true;
   }
   if (message && message.type === "resume" && !sender.tab) {
-    resume();
-    return false;
+    resume().then(
+      () => reply({}),
+      () => reply({}),
+    );
+    return true;
   }
   if (message && message.type === "label" && sender.url) {
-    const host = new URL(sender.url).hostname;
-    if (host) {
-      label(host).then(reply, () => reply({ labelled: false }));
+    let { hostname: host, origin } = new URL(sender.url);
+    // about:blank and srcdoc frames load as their parent's origin.
+    if (!host && /^about:/.test(sender.url) && typeof message.origin === "string") {
+      try {
+        ({ hostname: host, origin } = new URL(message.origin));
+      } catch {
+        host = "";
+      }
+    }
+    // initiatorDomains takes domain names and IPv4 addresses, not [IPv6] literals.
+    if (host && !host.startsWith("[")) {
+      label(host, origin).then(reply, (e) => {
+        console.error("decdn: could not label", host, e);
+        reply({ labelled: false });
+      });
       return true;
     }
   }
   return false;
 });
 
-// A new token or gateway address makes every existing label stale.
-chrome.storage.onChanged.addListener(async (changes) => {
+// A new token or gateway address makes every existing label stale. Pages
+// re-label straight away, so keep the rules already made with the new values.
+chrome.storage.onChanged.addListener((changes) => {
   if (changes.token || changes.gateway) {
-    const rules = await chrome.declarativeNetRequest.getSessionRules();
-    await chrome.declarativeNetRequest.updateSessionRules({
-      removeRuleIds: rules.map((r) => r.id),
-    });
+    dropStaleRules().catch((e) => console.error("decdn: rules", e));
   }
 });
+
+async function dropStaleRules() {
+  const { gateway, token } = await settings();
+  const current = (r) =>
+    r.condition.regexFilter === contentFilter(gateway) &&
+    r.action.requestHeaders?.some((h) => h.header === "x-decdn-token" && h.value === token);
+  const rules = await chrome.declarativeNetRequest.getSessionRules();
+  await chrome.declarativeNetRequest.updateSessionRules({
+    removeRuleIds: rules.filter((r) => !current(r)).map((r) => r.id),
+  });
+}
