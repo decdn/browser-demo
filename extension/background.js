@@ -7,6 +7,10 @@
 // it. The gateway pays with the capability whose scope covers the host.
 
 const DEFAULT_GATEWAY = "127.0.0.1:8484";
+// The gateway is always on loopback: the token never leaves the machine.
+const GATEWAY = /^(127\.0\.0\.1|localhost):\d{1,5}$/;
+// Session rules are capped (5000 in Chrome); stay well under it.
+const MAX_RULES = 1000;
 const RESOURCE_TYPES = ["image", "media", "main_frame", "sub_frame", "object"];
 
 // Only content paths (/<64-hex hash>...) get the token, never the gateway's
@@ -16,17 +20,43 @@ function contentFilter(gateway) {
   return `^http://${escaped}/[0-9a-fA-F]{64}([/?#]|$)`;
 }
 
-// A stable rule id per page host (DNR ids are positive 31-bit integers).
-function ruleId(host) {
-  let h = 0;
-  for (const c of host) h = (Math.imul(h, 31) + c.charCodeAt(0)) | 0;
-  return (h & 0x7fffffff) || 1;
+// Runs storage read-modify-writes one at a time, so two callers never lose
+// each other's update.
+let queue = Promise.resolve();
+function serial(fn) {
+  const run = queue.then(fn);
+  queue = run.catch(() => {});
+  return run;
 }
 
 async function settings() {
   const { gateway } = await chrome.storage.sync.get({ gateway: DEFAULT_GATEWAY });
   const { token } = await chrome.storage.local.get({ token: "" });
-  return { gateway, token };
+  return { gateway: GATEWAY.test(gateway) ? gateway : DEFAULT_GATEWAY, token };
+}
+
+// One rule id per page host, from a map in session storage: ids never
+// collide, and the least recently labelled host is dropped past MAX_RULES.
+// Returns [id, ids of evicted rules].
+function ruleId(host) {
+  return serial(async () => {
+    const { rules = {}, nextId = 1 } = await chrome.storage.session.get(["rules", "nextId"]);
+    const evicted = [];
+    let id = rules[host]?.id;
+    let next = nextId;
+    if (!id) {
+      id = next++;
+      const hosts = Object.keys(rules).sort((a, b) => rules[a].used - rules[b].used);
+      while (hosts.length >= MAX_RULES) {
+        const old = hosts.shift();
+        evicted.push(rules[old].id);
+        delete rules[old];
+      }
+    }
+    rules[host] = { id, used: Date.now() };
+    await chrome.storage.session.set({ rules, nextId: next });
+    return [id, evicted];
+  });
 }
 
 async function label(host, origin) {
@@ -34,9 +64,9 @@ async function label(host, origin) {
   if (!token) return { gateway, labelled: false };
   // Content the gateway serves runs on the gateway's own origin; never label it.
   if (origin === `http://${gateway}`) return { gateway, labelled: false };
-  const id = ruleId(host);
+  const [id, evicted] = await ruleId(host);
   await chrome.declarativeNetRequest.updateSessionRules({
-    removeRuleIds: [id],
+    removeRuleIds: [id, ...evicted],
     addRules: [
       {
         id,
@@ -80,11 +110,19 @@ async function pendingDelegates() {
   return pending;
 }
 
-async function setPending(address, since) {
-  const pending = await pendingDelegates();
-  if (since) pending[address] = since;
-  else delete pending[address];
-  await chrome.storage.session.set({ pending });
+// Keeps an alarm running while a delegate waits: if the browser stops the
+// worker anyway, the alarm wakes it and resume() picks the polling up again.
+const HEARTBEAT = "sponsor-heartbeat";
+
+function setPending(address, since) {
+  return serial(async () => {
+    const pending = await pendingDelegates();
+    if (since) pending[address] = since;
+    else delete pending[address];
+    await chrome.storage.session.set({ pending });
+    if (Object.keys(pending).length) await chrome.alarms.create(HEARTBEAT, { periodInMinutes: 0.5 });
+    else await chrome.alarms.clear(HEARTBEAT);
+  });
 }
 
 // One look at the onramp for `address`: registers the capability when it is
@@ -134,6 +172,9 @@ async function resume() {
 }
 
 resume();
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === HEARTBEAT) resume();
+});
 
 // Mint a delegate, record it as pending before anything can stop this worker,
 // open the onramp's check for it, and poll until its capability is registered.
@@ -157,10 +198,21 @@ chrome.runtime.onMessage.addListener((message, sender, reply) => {
   }
   if (message && message.type === "resume" && !sender.tab) {
     resume();
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === HEARTBEAT) resume();
+});
     return false;
   }
   if (message && message.type === "label" && sender.url) {
-    const { hostname: host, origin } = new URL(sender.url);
+    let { hostname: host, origin } = new URL(sender.url);
+    // about:blank and srcdoc frames load as their parent's origin.
+    if (!host && /^about:/.test(sender.url) && typeof message.origin === "string") {
+      try {
+        ({ hostname: host, origin } = new URL(message.origin));
+      } catch {
+        host = "";
+      }
+    }
     if (host) {
       label(host, origin).then(reply, () => reply({ labelled: false }));
       return true;
